@@ -1,0 +1,209 @@
+version: 2.1
+ 
+orbs:
+  maven: circleci/maven@1.0.2
+  shield: shield/hook@volatile
+  aws-cli: circleci/aws-cli@1.3.0
+ 
+parameters:
+  image_name:
+    type: string
+    default: sb-vgsipservice
+  aws_account_id:
+    type: integer
+    default: 189849168476
+  aws_region:
+    type: string
+    default: us-east-1
+  dockerfile:
+    type: string
+    default: .circleci/Dockerfile
+ 
+jobs:
+  build:
+    docker:
+      - image: cimg/openjdk:8.0
+    steps:
+      - checkout
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY_ID_CODEARTIFACT_PROD
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY_CODEARTIFACT_PROD
+      - run:
+          name: "Get CODEARTIFACT_AUTH_TOKEN"
+          command: echo "export CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token --domain ac-utility --domain-owner 189849168476 --query authorizationToken --output text)" >> ${BASH_ENV}
+      - run:
+          name: "Store commit sha from git"
+          command: git rev-parse --short=7 HEAD > .circleci/commit_sha
+      - maven/with_cache:
+          maven_command: mvn -s .circleci/settings.xml dependency:purge-local-repository -DmanualIncludes=com.allconnect:AllConnectParent
+          settings_file: .circleci/settings.xml
+          steps:
+            - run:
+                name: "Build"
+                command: mvn -s .circleci/settings.xml clean install -U
+            - run:
+                name: "Verify version with latest tag"
+                command: chmod +x .circleci/verify-version.sh && bash .circleci/verify-version.sh
+      - persist_to_workspace:
+          root: .
+          paths:
+            - ./
+ 
+  static-code-analysis:
+    docker:
+      - image: cimg/openjdk:8.0
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY_ID_CODEARTIFACT_PROD
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY_CODEARTIFACT_PROD
+      - run:
+          name: "Get CODEARTIFACT_AUTH_TOKEN"
+          command: echo "export CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token --domain ac-utility --domain-owner 189849168476 --query authorizationToken --output text)" >> ${BASH_ENV}
+      - maven/with_cache:
+          maven_command: mvn -s .circleci/settings.xml dependency:purge-local-repository -DmanualIncludes=com.allconnect:AllConnectParent
+          settings_file: .circleci/settings.xml
+          steps:
+            - run: mvn -s .circleci/settings.xml org.sonarsource.scanner.maven:sonar-maven-plugin:3.9.1.2184:sonar -Dmaven.test.skip=true -Dsonar.projectKey=acu-sb-vgsipservice -Dsonar.host.url=https://sonarqube.ac-utility.redventures.io -Dsonar.login=$SONAR_TOKEN
+ 
+  deploy-to-codeartifact:
+    docker:
+      - image: cimg/openjdk:8.0
+    steps:
+      - attach_workspace:
+          at: .
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY_ID_CODEARTIFACT_PROD
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY_CODEARTIFACT_PROD
+      - run:
+          name: "Get CODEARTIFACT_AUTH_TOKEN"
+          command: echo "export CODEARTIFACT_AUTH_TOKEN=$(aws codeartifact get-authorization-token --domain ac-utility --domain-owner 189849168476 --query authorizationToken --output text)" >> ${BASH_ENV}
+      - maven/with_cache:
+          settings_file: .circleci/settings.xml
+          steps:
+            - run:
+                name: "Deploy"
+                command: mvn -s .circleci/settings.xml deploy -Dmaven.test.skip=true -DaltDeploymentRepository=ac-utility-maven::default::https://ac-utility-189849168476.d.codeartifact.us-east-1.amazonaws.com/maven/maven/
+ 
+  publish-github-release:
+    docker:
+      - image: circleci/golang:1.8
+    steps:
+      - attach_workspace:
+          at: ./artifacts
+      - run:
+          name: "Publish Release on GitHub"
+          command: chmod +x artifacts/.circleci/perform_release.sh && bash artifacts/.circleci/perform_release.sh
+ 
+  docker_build_ship:
+    docker:
+      - image: cimg/openjdk:8.0
+    steps:
+      - attach_workspace:
+          at: .
+      - setup_remote_docker:
+          docker_layer_caching: false
+      - run: |
+          echo 'export TAG=$(cat .circleci/commit_sha)' >> $BASH_ENV
+          echo 'export RELEASE_TAG=v$(cat .circleci/VERSION)' >> $BASH_ENV
+          source $BASH_ENV
+          echo "The docker image tag $TAG and $RELEASE_TAG"
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY_ID_ECR_PROD
+          aws-secret-access-key: AWS_SECRET_ACCESS_KEY_ECR_PROD
+      - run: >-
+          aws ecr get-login-password --region <<pipeline.parameters.aws_region>> | docker login --username AWS --password-stdin <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com
+      - run: |
+          docker build -f <<pipeline.parameters.dockerfile>> -t <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:$TAG --build-arg JAR_FILE=/target/<<pipeline.parameters.image_name>>.jar . &&
+          docker push <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:$TAG &&
+          docker tag <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:$TAG <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:$RELEASE_TAG &&
+          docker push <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:$RELEASE_TAG &&
+          docker tag <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:$TAG <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:latest &&
+          docker push <<pipeline.parameters.aws_account_id>>.dkr.ecr.<<pipeline.parameters.aws_region>>.amazonaws.com/<<pipeline.parameters.image_name>>:latest
+ 
+  deploy:
+    docker:
+      - image: cimg/openjdk:8.0
+    steps:
+      - attach_workspace:
+          at: .
+      - run: |
+          echo 'export RELEASE_TAG=v$(cat .circleci/VERSION)' >> $BASH_ENV
+          source $BASH_ENV
+      - shield/notify_artifact_built:
+          token: SHIELD_TOKEN
+          artifact_name: $RELEASE_TAG
+ 
+workflows:
+  build-and-release:
+    jobs:
+      - build:
+          context: ac-utility
+          filters:
+            branches:
+              only:
+                - main
+      - static-code-analysis:
+          context: ac-utility
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - main
+      - deploy-to-codeartifact:
+          context: ac-utility
+          requires:
+            - static-code-analysis
+          filters:
+            branches:
+              only:
+                - main
+      - publish-github-release:
+          context: ac-utility
+          requires:
+            - static-code-analysis
+          filters:
+            branches:
+              only:
+                - main
+      - docker_build_ship:
+          context: ac-utility
+          requires:
+            - deploy-to-codeartifact
+            - publish-github-release
+          filters:
+            branches:
+              only:
+                - main
+      - deploy:
+          context: ac-utility
+          requires:
+            - docker_build_ship
+          filters:
+            branches:
+              only: main
+ 
+  build_only:
+    jobs:
+      - build:
+          context: ac-utility
+          filters:
+            branches:
+              ignore:
+                - main
+            tags:
+              ignore:
+                - /.*/
+      - static-code-analysis:
+          context: ac-utility
+          requires:
+            - build
+          filters:
+            branches:
+              ignore:
+                - main
+            tags:
+              ignore:
+                - /.*/
